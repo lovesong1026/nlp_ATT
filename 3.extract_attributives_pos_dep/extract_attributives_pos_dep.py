@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from ltp import LTP
@@ -171,6 +172,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", type=Path, help="每行一句的 Markdown 文本")
     parser.add_argument("output", type=Path, help="Markdown 输出文件")
+    parser.add_argument(
+        "--dimension-input",
+        type=Path,
+        help=(
+            "可选：与原文件按物理行号对齐的维度提取后问题；"
+            "缺失行按空结果处理"
+        ),
+    )
     parser.add_argument("--model", default="LTP/base", help="LTP 模型名称或路径")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
@@ -215,6 +224,150 @@ def locate_token_spans(sentence: str, words: list[str]) -> list[tuple[int, int]]
         spans.append((start, end))
         cursor = end
     return spans
+
+
+def normalize_with_positions(text: str) -> tuple[str, list[int]]:
+    """移除空白并保留规范化字符到原句字符位置的映射。"""
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        chars.append(char)
+        positions.append(index)
+    return "".join(chars), positions
+
+
+def merge_character_positions(
+    positions: set[int],
+    sentence: str,
+) -> list[tuple[int, int]]:
+    """把离散字符位置合并成原句中的左闭右开区间。"""
+    if not positions:
+        return []
+    ordered = sorted(positions)
+    spans: list[tuple[int, int]] = []
+    start = ordered[0]
+    previous = ordered[0]
+    for position in ordered[1:]:
+        between = sentence[previous + 1 : position]
+        if position == previous + 1 or not between.strip():
+            previous = position
+            continue
+        spans.append((start, previous + 1))
+        start = position
+        previous = position
+    spans.append((start, previous + 1))
+    return spans
+
+
+def align_dimension_sentence(
+    original: str,
+    dimension_sentence: str,
+    *,
+    missing_as_empty: bool,
+) -> dict[str, object]:
+    """定位原句中被维度提取过程删除的字符，不进行字符串改写。"""
+    normalized_original, original_positions = normalize_with_positions(original)
+    normalized_dimension, _ = normalize_with_positions(dimension_sentence)
+
+    if not normalized_dimension:
+        excluded_positions = {
+            position
+            for position in original_positions
+            if not original[position].isspace()
+        }
+        status = "缺失按空处理" if missing_as_empty else "空结果"
+    else:
+        matcher = SequenceMatcher(
+            None,
+            normalized_original,
+            normalized_dimension,
+            autojunk=False,
+        )
+        retained_normalized: set[int] = set()
+        invalid_operations: list[str] = []
+        for tag, original_start, original_end, dim_start, dim_end in matcher.get_opcodes():
+            if tag == "equal":
+                retained_normalized.update(range(original_start, original_end))
+            elif tag != "delete":
+                invalid_operations.append(
+                    f"{tag}:{original_start}-{original_end}/"
+                    f"{dim_start}-{dim_end}"
+                )
+        if invalid_operations:
+            raise ValueError(
+                "维度后问题不是原句的纯删除结果："
+                f"original={original!r}, dimension={dimension_sentence!r}, "
+                f"operations={invalid_operations}"
+            )
+
+        excluded_positions = {
+            original_positions[index]
+            for index in range(len(original_positions))
+            if index not in retained_normalized
+        }
+        status = "未删除维度" if not excluded_positions else "已对齐"
+
+    excluded_spans = merge_character_positions(excluded_positions, original)
+    excluded_texts = [
+        original[start:end].strip()
+        for start, end in excluded_spans
+        if original[start:end].strip()
+    ]
+    return {
+        "dimension_sentence": dimension_sentence,
+        "dimension_status": status,
+        "excluded_positions": excluded_positions,
+        "excluded_spans": excluded_spans,
+        "excluded_texts": excluded_texts,
+    }
+
+
+def filter_candidates_by_dimensions(
+    candidates: list[dict[str, object]],
+    excluded_positions: set[int],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """定语或中心词字符区间碰到已删除维度，就过滤整条候选。"""
+    kept: list[dict[str, object]] = []
+    decisions: list[dict[str, object]] = []
+    for candidate in candidates:
+        start = int(candidate["start"])
+        end = int(candidate["end"])
+        head_start = int(candidate["head_start"])
+        head_end = int(candidate["head_end"])
+        modifier_overlap = sorted(
+            position
+            for position in excluded_positions
+            if start <= position < end
+        )
+        head_overlap = sorted(
+            position
+            for position in excluded_positions
+            if head_start <= position < head_end
+        )
+        keep = not modifier_overlap and not head_overlap
+        if modifier_overlap and head_overlap:
+            filter_reason = "定语和中心词均包含已抽取维度"
+        elif modifier_overlap:
+            filter_reason = "定语包含已抽取维度"
+        else:
+            filter_reason = "中心词包含已抽取维度"
+        decisions.append(
+            {
+                "action": "保留" if keep else "过滤",
+                "reason": (
+                    "定语和中心词均未包含已抽取维度"
+                    if keep
+                    else filter_reason
+                ),
+                "modifier_text": candidate["modifier_text"],
+                "head_text": candidate["head_text"],
+            }
+        )
+        if keep:
+            kept.append(candidate)
+    return kept, decisions
 
 
 def build_children(heads: list[int]) -> list[list[int]]:
@@ -521,6 +674,8 @@ def find_copular_clause_candidates(
                 "start": start_char,
                 "end": end_char,
                 "head_index": target,
+                "head_start": spans[target][0],
+                "head_end": spans[target][1],
             }
         )
     return candidates
@@ -638,6 +793,8 @@ def analyze_sentence(
                 "start": start_char,
                 "end": end_char,
                 "head_index": final_head_index,
+                "head_start": spans[final_head_index][0],
+                "head_end": spans[final_head_index][1],
             }
         )
 
@@ -678,6 +835,8 @@ def analyze_sentence(
                 "start": spans[modifier][0],
                 "end": spans[modifier][1],
                 "head_index": target,
+                "head_start": spans[target][0],
+                "head_end": spans[target][1],
             }
         )
 
@@ -753,9 +912,22 @@ def format_final(items: list[dict[str, object]]) -> str:
     ) or "无"
 
 
+def format_dimension_decisions(items: list[dict[str, object]]) -> str:
+    return "；".join(
+        f"{item['action']}[{item['reason']}]："
+        f"{item['modifier_text']} → {item['head_text']}"
+        for item in items
+    ) or "无"
+
+
 def main() -> None:
     args = parse_args()
     source_lines = args.input.read_text(encoding="utf-8").splitlines()
+    dimension_lines = (
+        args.dimension_input.read_text(encoding="utf-8").splitlines()
+        if args.dimension_input
+        else []
+    )
     records = [
         (line_number, line.strip())
         for line_number, line in enumerate(source_lines, start=1)
@@ -789,6 +961,32 @@ def main() -> None:
                     "sentence": sentence,
                 }
             )
+            if args.dimension_input:
+                dimension_index = line_number - 1
+                missing_as_empty = dimension_index >= len(dimension_lines)
+                dimension_sentence = (
+                    ""
+                    if missing_as_empty
+                    else dimension_lines[dimension_index].strip()
+                )
+                dimension_alignment = align_dimension_sentence(
+                    sentence,
+                    dimension_sentence,
+                    missing_as_empty=missing_as_empty,
+                )
+                filtered_candidates, dimension_decisions = (
+                    filter_candidates_by_dimensions(
+                        analysis["final_candidates"],
+                        dimension_alignment["excluded_positions"],
+                    )
+                )
+                analysis.update(dimension_alignment)
+                analysis["dimension_decisions"] = dimension_decisions
+                analysis["dimension_filtered_candidates"] = filtered_candidates
+            else:
+                analysis["dimension_filtered_candidates"] = analysis[
+                    "final_candidates"
+                ]
             analyses.append(analysis)
 
         completed = min(start + len(batch), len(records))
@@ -809,23 +1007,64 @@ def main() -> None:
         f"- 自定义词频：`{args.segmentation_word_frequency}`。",
         "- POS作用：过滤疑问、数量和时间噪声；区分普通定语、业务词和定语从句。",
         "- 完整定语：只截取原句片段，不进行语义改写。",
-        "- 当前阶段：不使用LLM、SRL、excluded_dimensions或Schema映射。",
+        "- 当前阶段：不使用LLM、SRL、Schema映射或文本改写。",
+        *(
+            [
+                f"- 维度后问题：`{args.dimension_input.as_posix()}`。",
+                "- 维度过滤：按物理行号对齐；缺失行按空结果处理；"
+                "定语或中心词字符区间与已删除维度重叠时过滤整条候选。",
+            ]
+            if args.dimension_input
+            else ["- 维度过滤：未启用。"]
+        ),
         "",
-        "| 原文件行号 | 原句 | 分词（cws） | 词性（pos） | "
-        "原始ATT | POS辅助判定 | 最终完整定语 |",
-        "|---:|---|---|---|---|---|---|",
+        *(
+            [
+                "| 原文件行号 | 原句 | 维度后问题 | 已删除维度片段 | "
+                "分词（cws） | 词性（pos） | 原始ATT | POS辅助判定 | "
+                "维度过滤前定语 | 维度过滤判定 | 最终定语（去维度） |",
+                "|---:|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            if args.dimension_input
+            else [
+                "| 原文件行号 | 原句 | 分词（cws） | 词性（pos） | "
+                "原始ATT | POS辅助判定 | 最终完整定语 |",
+                "|---:|---|---|---|---|---|---|",
+            ]
+        ),
     ]
 
     for analysis in analyses:
-        output_lines.append(
-            f"| {analysis['source_line']} | "
-            f"{escape_table_cell(analysis['sentence'])} | "
-            f"{escape_table_cell(analysis['segmentation'])} | "
-            f"{escape_table_cell(analysis['word_pos'])} | "
-            f"{escape_table_cell(format_raw_att(analysis['raw_att']))} | "
-            f"{escape_table_cell(format_decisions(analysis['decisions']))} | "
-            f"{escape_table_cell(format_final(analysis['final_candidates']))} |"
-        )
+        if args.dimension_input:
+            dimension_display = (
+                analysis["dimension_sentence"]
+                if analysis["dimension_sentence"]
+                else f"（{analysis['dimension_status']}）"
+            )
+            excluded_display = "；".join(analysis["excluded_texts"]) or "无"
+            output_lines.append(
+                f"| {analysis['source_line']} | "
+                f"{escape_table_cell(analysis['sentence'])} | "
+                f"{escape_table_cell(dimension_display)} | "
+                f"{escape_table_cell(excluded_display)} | "
+                f"{escape_table_cell(analysis['segmentation'])} | "
+                f"{escape_table_cell(analysis['word_pos'])} | "
+                f"{escape_table_cell(format_raw_att(analysis['raw_att']))} | "
+                f"{escape_table_cell(format_decisions(analysis['decisions']))} | "
+                f"{escape_table_cell(format_final(analysis['final_candidates']))} | "
+                f"{escape_table_cell(format_dimension_decisions(analysis['dimension_decisions']))} | "
+                f"{escape_table_cell(format_final(analysis['dimension_filtered_candidates']))} |"
+            )
+        else:
+            output_lines.append(
+                f"| {analysis['source_line']} | "
+                f"{escape_table_cell(analysis['sentence'])} | "
+                f"{escape_table_cell(analysis['segmentation'])} | "
+                f"{escape_table_cell(analysis['word_pos'])} | "
+                f"{escape_table_cell(format_raw_att(analysis['raw_att']))} | "
+                f"{escape_table_cell(format_decisions(analysis['decisions']))} | "
+                f"{escape_table_cell(format_final(analysis['final_candidates']))} |"
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(output_lines) + "\n", encoding="utf-8")

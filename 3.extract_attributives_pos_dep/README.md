@@ -6,8 +6,9 @@
 cws + pos + dep
 ```
 
-目标是验证 POS 如何辅助 DEP/ATT 提取业务定语。当前不加入 LLM、SRL、
-`excluded_dimensions`、Schema 映射或问句改写。
+目标是验证 POS 如何辅助 DEP/ATT 提取业务定语，并可选地结合
+`dimension_extracted_question.md` 过滤已经抽取的维度。当前不加入
+LLM、SRL、Schema 映射或问句改写。
 
 ## 当前配置
 
@@ -28,6 +29,19 @@ cws + pos + dep
 7. ATT 错挂到“个、次、张”等量词时，沿依存中心提升到内容词。
 8. 对漏标的等级、风险、“交付”、网络质量及英文数字专名，只在右侧局部窗口中恢复到明确业务实体。
 
+## 维度过滤
+
+通过 `--dimension-input` 传入维度提取后的问题时：
+
+1. 两个文件按物理行号对齐，空行也占据对应位置。
+2. 维度后问题必须是原句忽略空白后的纯删除结果，出现替换时立即报错。
+3. 代码记录原句中被删除维度的字符区间。
+4. 定语或中心词的字符区间只要与已删除维度重叠，就过滤整条候选。
+5. 维度文件末尾缺失的行按空结果处理，即整句候选全部过滤。
+
+模型仍分析完整原句，维度后问题只参与最终候选过滤，不参与 CWS、POS
+或 DEP 推理。
+
 例如：
 
 ```text
@@ -44,6 +58,16 @@ conda run -n minimind python \
   "3.extract_attributives_pos_dep/original_question_attributives_pos_dep.md"
 ```
 
+启用维度过滤：
+
+```bash
+conda run -n minimind python \
+  "3.extract_attributives_pos_dep/extract_attributives_pos_dep.py" \
+  "data/original_question.md" \
+  "3.extract_attributives_pos_dep/original_question_attributives_pos_dep_dimension_filtered.md" \
+  --dimension-input "data/dimension_extracted_question.md"
+```
+
 ## 输出列
 
 - 原始问题
@@ -52,3 +76,11 @@ conda run -n minimind python \
 - DEP 原始 ATT
 - POS 辅助判定及原因
 - 最终完整定语
+
+启用维度过滤后还会输出：
+
+- 维度后问题
+- 已删除维度片段
+- 维度过滤前定语
+- 维度过滤判定
+- 最终定语（去维度）
