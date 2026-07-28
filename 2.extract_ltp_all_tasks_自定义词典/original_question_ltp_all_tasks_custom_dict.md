@@ -3,7 +3,7 @@
 - 来源：`data/original_question.md`
 - 模型：`LTP/base`
 - LTP任务：`cws + pos + ner + srl + dep + sdp + sdpg`。
-- 自定义词典：`SEGMENTATION_WORDS`，共66词。
+- 自定义词典：`segmentation_words.txt`，共66词。
 - 自定义词频：`2`。
 - 词典作用：只保护分词边界，不进行语义改写。
 - token序号：从1开始；`0:ROOT`表示根节点。

@@ -9,76 +9,38 @@ from ltp import LTP
 
 ALL_TASKS = ["cws", "pos", "ner", "srl", "dep", "sdp", "sdpg"]
 
-# 从当前业务问题中整理的最小不可拆分词，共 66 个。
-# 仅保护 LTP 分词边界，不进行语义改写。
-SEGMENTATION_WORDS = [
-    "运营商BG",
-    "中东中亚",
-    "南部非洲",
-    "北部非洲",
-    "印度尼西亚",
-    "中国区",
-    "地区部",
-    "代表处",
-    "系统部",
-    "亚太",
-    "拉美",
-    "南亚",
-    "印尼",
-    "二级以上",
-    "一二级",
-    "高风险",
-    "中风险",
-    "S级",
-    "A级",
-    "一级",
-    "二级",
-    "高危",
-    "重大",
-    "供方类问题",
-    "产品质量",
-    "服务质量",
-    "网络质量",
-    "物料供应",
-    "分包资源",
-    "供方问题",
-    "解决方案",
-    "华为问题",
-    "设备增量",
-    "国家三领先",
-    "三领先",
-    "领导力践行",
-    "交付售前",
-    "管理升级",
-    "网上事故",
-    "变更倒回",
-    "变更操作",
-    "疲劳驾驶",
-    "小国小网",
-    "网络维护",
-    "客户声音",
-    "工程实施",
-    "比拼网络",
-    "比拼项目",
-    "系统集成",
-    "数据中心",
-    "网络规划",
-    "工程优化",
-    "数据分析",
-    "辅助运营",
-    "网络部署",
-    "提示单",
-    "客满",
-    "完成率",
-    "成功率",
-    "及时率",
-    "成本率",
-    "利润率",
-    "销毛率",
-    "成熟度",
-    "占比",
-    "根因",
-]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SEGMENTATION_DICTIONARY = PROJECT_ROOT / "segmentation_words.txt"
+
+
+def load_segmentation_words(path: Path) -> list[str]:
+    """读取一行一词的 UTF-8 分词词典，并拒绝重复词和空词典。"""
+    words: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        word = raw_line.strip()
+        if not word or word.startswith("#"):
+            continue
+        if word in seen:
+            raise ValueError(
+                f"分词词典存在重复词：{path}:{line_number}: {word}"
+            )
+        seen.add(word)
+        words.append(word)
+    if not words:
+        raise ValueError(f"分词词典为空：{path}")
+    return words
+
+
+def display_project_path(path: Path) -> str:
+    """项目内路径显示为相对路径，项目外路径显示原路径。"""
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +56,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="注册自定义词时使用的词频权重（默认 2）",
+    )
+    parser.add_argument(
+        "--segmentation-dictionary",
+        type=Path,
+        default=DEFAULT_SEGMENTATION_DICTIONARY,
+        help=(
+            "一行一词的 UTF-8 分词词典；"
+            "默认使用项目根目录的 segmentation_words.txt"
+        ),
     )
     args = parser.parse_args()
     if args.batch_size < 1:
@@ -217,6 +188,9 @@ def format_sdpg(words: list[str], edges: list[Any]) -> str:
 
 def main() -> None:
     args = parse_args()
+    segmentation_words = load_segmentation_words(
+        args.segmentation_dictionary
+    )
     source_lines = args.input.read_text(encoding="utf-8").splitlines()
     records = [
         (line_number, text.strip())
@@ -226,7 +200,7 @@ def main() -> None:
 
     model = LTP(args.model)
     model.add_words(
-        SEGMENTATION_WORDS,
+        segmentation_words,
         freq=args.segmentation_word_frequency,
     )
     analyses: list[dict[str, str | int]] = []
@@ -287,7 +261,8 @@ def main() -> None:
         f"- 来源：`{args.input.as_posix()}`",
         f"- 模型：`{args.model}`",
         "- LTP任务：`cws + pos + ner + srl + dep + sdp + sdpg`。",
-        f"- 自定义词典：`SEGMENTATION_WORDS`，共{len(SEGMENTATION_WORDS)}词。",
+        f"- 自定义词典：`{display_project_path(args.segmentation_dictionary)}`，"
+        f"共{len(segmentation_words)}词。",
         f"- 自定义词频：`{args.segmentation_word_frequency}`。",
         "- 词典作用：只保护分词边界，不进行语义改写。",
         "- token序号：从1开始；`0:ROOT`表示根节点。",
