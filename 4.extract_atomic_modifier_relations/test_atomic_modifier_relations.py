@@ -60,6 +60,18 @@ def relations(
 
 
 class AtomicAttRepairTests(unittest.TestCase):
+    def test_generic_predicate_cannot_be_att_entity_head(self) -> None:
+        decision, reason, keep = MODULE.classify_atomic_att(
+            "A级",
+            "b",
+            "有",
+            "v",
+            set(),
+        )
+        self.assertEqual(decision, "过滤")
+        self.assertIn("通用谓词", reason)
+        self.assertFalse(keep)
+
     def test_dimension_filter_removes_relation_touching_deleted_text(
         self,
     ) -> None:

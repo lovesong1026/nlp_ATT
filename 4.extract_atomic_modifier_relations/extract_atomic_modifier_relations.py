@@ -382,6 +382,12 @@ def classify_atomic_att(
     if head in NON_ENTITY_HEAD_WORDS:
         return "过滤", "中心词为比较或统计运算词", False
 
+    if (
+        head in GENERIC_PREDICATE_WORDS
+        and head not in segmentation_words
+    ):
+        return "过滤", "中心词为通用谓词，不是业务实体", False
+
     if NOISE_WORD_PATTERN.fullmatch(modifier) is not None:
         return "过滤", "疑问、指示或数量噪声", False
 
@@ -438,6 +444,8 @@ def is_content_head(
         return True
     return not (
         word in POSITIONAL_FUNCTION_WORDS
+        or
+        word in GENERIC_PREDICATE_WORDS
         or
         pos in FUNCTION_POS
         or pos in QUESTION_OR_QUANTITY_POS
@@ -2338,11 +2346,22 @@ def main() -> None:
                     dimension_alignment["excluded_positions"],
                 )
             )
+            structural_surface_candidates = (
+                merge_rules.structural_surface_candidates(
+                    sentence,
+                    analysis["words"],
+                    analysis["pos_tags"],
+                    analysis["token_spans"],
+                    dimension_filtered_atomic_att,
+                    dimension_alignment["excluded_positions"],
+                )
+            )
             rule_merged_att = merge_rules.select_merged_results(
                 graph_merge_candidates,
                 srl_merge_candidates,
                 compact_entity_candidates,
                 METRIC_HEAD_PATTERN,
+                structural_surface_candidates,
             )
             analysis.update(
                 {
@@ -2439,7 +2458,8 @@ def main() -> None:
         "中心词命中已删除维度时过滤整条原子关系；空行及缺失行"
         "按空结果处理。",
         "- 规则合并：最后一列复用第4.1阶段的无LLM规则；不修改前面的"
-        "原子ATT结果，不做改写、完整后置状态转换或Schema映射。",
+        "原子ATT结果；允许恢复原句中显式的后置状态/原因结构，"
+        "但不改写、不补词、不做Schema映射。",
         f"- 原子ATT统计：DEP原始{raw_att_count}条，"
         f"第四阶段POS筛选后{pos_filtered_relation_count}条，"
         f"发现结构异常{anomaly_count}条，"
