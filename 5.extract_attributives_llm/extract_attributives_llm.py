@@ -23,12 +23,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DIMENSION_FILE = PROJECT_ROOT / "data/dimension_extracted_question.md"
 DEFAULT_STAGE3_FILE = (
     PROJECT_ROOT
-    / "3.extract_attributives_pos_dep/original_question_attributives_pos_dep.md"
+    / "3.extract_dep_raw/original_question_dep_raw.md"
 )
 DEFAULT_STAGE4_FILE = (
     PROJECT_ROOT
-    / "4.recover_verbal_attributives_srl/"
-    "original_question_verbal_attributives_srl.md"
+    / "4.extract_atomic_modifier_relations/"
+    "original_question_atomic_modifier_relations.md"
 )
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 PROMPT_VERSION = "stage5-v9"

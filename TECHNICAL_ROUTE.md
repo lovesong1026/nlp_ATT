@@ -93,12 +93,12 @@ cws/pos/ner/srl/dep/sdp/sdpg                       │
 验证词典对七任务的连锁影响                           │
         │                                            │
         ▼                                            │
-第3阶段：POS + DEP                                  │
-抽取并过滤原子 ATT                                  │
+第3阶段：DEP 原始事实                               │
+保存完整依存图和全部原始 ATT                         │
         │                                            │
         ▼                                            │
-第4阶段：POS + DEP + SRL                            │
-解释并恢复动词性完整定语                             │
+第4阶段：POS + DEP + SDP + SRL                      │
+筛选、纠错并补召回原子 ATT                           │
         │                                            │
         └──────────────────┬─────────────────────────┘
                            ▼
@@ -209,30 +209,31 @@ conda run -n minimind python \
 分词干预。例如，词典改变 token 边界后，SRL 可能不再识别原有谓词，因此
 每次修改词典后都需要重新观察 POS、DEP 和 SRL。
 
-## 7. 第3阶段：POS + DEP 原子 ATT
+## 7. 第3阶段：DEP 原始句法事实
 
 目录：
 
 ```text
-3.extract_attributives_pos_dep/
+3.extract_dep_raw/
 ```
 
 任务：
 
 ```text
-cws + pos + dep
+cws + dep
 ```
 
 处理逻辑：
 
 1. 使用共享分词词典；
-2. 只读取 DEP 标签为 `ATT` 的直接关系；
-3. 使用 POS 和词面规则过滤时间、数量、疑问、指示和结构词噪声；
-4. 自定义词典中的中心词不因被误标为 `m/q` 而过滤；
-5. 输出原始 ATT、POS 判定和最终原子 ATT。
+2. 保存每个 token 的完整 DEP 依存边；
+3. 原样摘出所有 DEP 标签为 `ATT` 的直接关系；
+4. 不运行 POS，不筛选、不纠错、不补边；
+5. 输出可审计、不可逆信息尚未被删除的 DEP 事实基线。
 
 本阶段刻意不做：
 
+- POS 和词面筛选；
 - 完整定语重建；
 - 中心词提升；
 - 关系链合并；
@@ -243,77 +244,88 @@ cws + pos + dep
 
 ```bash
 conda run -n minimind python \
-  "3.extract_attributives_pos_dep/extract_attributives_pos_dep.py" \
+  "3.extract_dep_raw/extract_dep_raw.py" \
   "data/original_question.md" \
-  "3.extract_attributives_pos_dep/original_question_attributives_pos_dep.md"
+  "3.extract_dep_raw/original_question_dep_raw.md"
 ```
 
 当前全量结果：
 
 ```text
 问题：389 条
-原子 ATT：1270 条
-包含 ATT 的问题：377 条
+DEP 原始 ATT：1808 条
 ```
 
-原子 ATT 是高召回候选，不应直接作为 RAG 最终元数据。
+原始 DEP-ATT 包含时间、数量、疑问词和错误挂接，不应直接作为 RAG
+最终元数据。
 
-## 8. 第4阶段：SRL 辅助动词性定语恢复
+## 8. 第4阶段：原子 ATT 筛选、纠错与补召回
 
 目录：
 
 ```text
-4.recover_verbal_attributives_srl/
+4.extract_atomic_modifier_relations/
 ```
 
 任务：
 
 ```text
-cws + pos + dep + srl
+cws + pos + dep + sdp + srl
 ```
 
 职责：
 
-- DEP 确定“哪个动词修饰哪个中心词”；
-- POS 将恢复范围限制在动词性 ATT；
-- SRL 匹配同一 token 的谓词，并提供 A0、A1、原因、否定、方式等论元；
-- 原句字符区间决定最终片段；
-- “的”只作为显式边界和置信信号，不是唯一触发条件。
+- POS 和词面规则过滤时间、数量、疑问、指示及结构词噪声；
+- DEP 方向和局部路径识别量词误挂、反向 ATT 与紧凑名词短语漏边；
+- SDP 的受约束 `FEAT/dFEAT/mNEG/MANN` 边补充语义特征和否定极性；
+- 相邻词序恢复“负增长、及时恢复”等词法修饰；
+- 并列结构传播共享中心词；
+- “的”结构辅助寻找右侧名词中心词；
+- SRL 只提供谓词和目标论元证据，辅助纠正过短中心词；
+- 所有最终原子关系仍由原句中的两个现有 token 构成。
 
 示例：
 
 ```text
-DEP：导致 → 项目
-SRL：ARGM-PRP=由于物料供应原因，A1=项目
-恢复：由于物料供应原因导致的 → 项目
+DEP：高风险 -[ADV]→ 交付 -[ATT]→ 项目
+POS：高风险/a，交付/v，项目/n
+修复：高风险 → 项目
 ```
 
-恢复结果按证据分为：
+修复候选按证据分为：
 
-- `high`：显式“的”且具有中心词证据；
-- `medium`：只有其中一类强信号；
-- `low`：有连续候选但证据不足，只保留审计；
-- `unresolved`：SRL 谓词缺失、没有有效论元或范围不合法。
+- `high`：直接 DEP-ATT 或多个确定性结构信号共同支持；
+- `medium`：紧凑名词短语等局部结构支持，供后续语义阶段裁决；
+- `low`：证据不足，不自动进入第四阶段最终原子 ATT。
 
-只有 `high/medium` 进入“接受的动词定语”。恢复失败时保留第三阶段的原子
-ATT，不启用 DEP 子树 fallback。
+SRL 连续片段及旧版“接受的动词定语”列仅保留作审计和第五阶段辅助证据，
+不会替换第四阶段原子 ATT。
+
+当前全量结果：
+
+```text
+问题：389 条
+DEP 原始 ATT：1808 条
+POS 筛选后：1257 条
+结构修复候选：182 条
+第四阶段最终原子关系：1433 条
+```
 
 运行：
 
 ```bash
 conda run -n minimind python \
-  "4.recover_verbal_attributives_srl/extract_verbal_attributives_srl.py" \
+  "4.extract_atomic_modifier_relations/extract_atomic_modifier_relations.py" \
   "data/original_question.md" \
-  "4.recover_verbal_attributives_srl/original_question_verbal_attributives_srl.md"
+  "4.extract_atomic_modifier_relations/original_question_atomic_modifier_relations.md"
 ```
 
-当前全量结果：
+旁路 SRL 证据统计：
 
 ```text
 动词 ATT 候选：366 条
 SRL 连续候选：72 条
-接受恢复：55 条
-第四阶段完整结果：1270 条关系
+旧规则接受完整片段：55 条
 ```
 
 第四阶段仍然不做业务价值判断、维度过滤和最终关系合并。
@@ -505,6 +517,17 @@ medium：8
 ```
 
 第四阶段：
+
+```text
+全球 → 运营商
+运营商 → 业务
+业务 → 产品
+产品 → 质量
+导致 → 事故
+网上 → 事故
+```
+
+第四阶段同时保留但不用于替换原子 ATT 的 SRL 证据：
 
 ```text
 全球运营商业务产品质量导致的 → 事故

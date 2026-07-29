@@ -2,8 +2,8 @@
 
 - 原始问题：`data/original_question.md`
 - 维度结果：`data/dimension_extracted_question.md`
-- 第三阶段：`3.extract_attributives_pos_dep/original_question_attributives_pos_dep.md`
-- 第四阶段：`4.recover_verbal_attributives_srl/original_question_verbal_attributives_srl.md`
+- 第三阶段：`3.extract_dep_raw/original_question_dep_raw.md`
+- 第四阶段：`4.extract_atomic_modifier_relations/original_question_atomic_modifier_relations.md`
 - 模型：`qwen-plus`
 - 提示词版本：`stage5-v9`
 - 完成度：389/389
