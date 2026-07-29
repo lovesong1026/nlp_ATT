@@ -17,6 +17,7 @@ NOUN_LIKE_POS = {"n", "nl", "ns", "nt", "nz", "ni", "nh", "ws"}
 ATTRIBUTE_POS = {"a", "b", "j", "nd"}
 FUNCTION_POS = {"wp", "u", "p", "c", "d"}
 NEGATION_WORDS = {"不", "未", "无", "非", "没"}
+COORDINATION_WORDS = {"和", "与", "及", "或", "以及", "或者", "、"}
 POSITIONAL_FUNCTION_WORDS = {"中", "内"}
 NON_ENTITY_HEAD_WORDS = {"同比"}
 GENERIC_PREDICATE_WORDS = {
@@ -32,6 +33,18 @@ GENERIC_PREDICATE_WORDS = {
     "执行",
     "涉及",
     "导致",
+    "进行",
+    "占",
+    "属于",
+    "等于",
+    "大于",
+    "小于",
+    "高于",
+    "低于",
+    "超过",
+    "少于",
+    "多于",
+    "超期",
 }
 ALPHANUMERIC_TOKEN_PATTERN = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9_-]+$")
 PUNCTUATION_PATTERN = re.compile(r"^[，,。！？!?；;：:、]$")
@@ -117,7 +130,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", type=Path, help="每行一句的 Markdown 文本")
     parser.add_argument("output", type=Path, help="Markdown 输出文件")
-    parser.add_argument("--model", default="LTP/base", help="LTP 模型名称或路径")
+    parser.add_argument(
+        "--model",
+        default="LTP/base2",
+        help="LTP 模型名称或路径（默认 LTP/base2）",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
         "--segmentation-word-frequency",
@@ -713,27 +730,6 @@ def recover_verbal_attribute(
     return result
 
 
-def follows_att_chain(
-    start_index: int,
-    target_index: int,
-    heads: list[int],
-    labels: list[str],
-) -> bool:
-    """判断target是否是start沿正向ATT链可达的更完整中心词。"""
-    current = start_index
-    visited: set[int] = set()
-    while current not in visited:
-        visited.add(current)
-        if labels[current] != "ATT":
-            return False
-        current = heads[current] - 1
-        if current < 0:
-            return False
-        if current == target_index:
-            return True
-    return False
-
-
 def srl_corrected_head(
     modifier_index: int,
     head_index: int,
@@ -744,11 +740,9 @@ def srl_corrected_head(
     srl_frame: dict[str, Any] | None,
     segmentation_words: set[str],
 ) -> int | None:
-    """利用SRL目标论元纠正“未关闭的管理升级单”一类过短中心词。"""
-    if (
-        srl_frame is None
-        or find_explicit_de(modifier_index, head_index, words) is None
-    ):
+    """利用显式“的”和SRL目标论元纠正过短或指标化中心词。"""
+    de_index = find_explicit_de(modifier_index, head_index, words)
+    if srl_frame is None or de_index is None:
         return None
 
     target_arguments = [
@@ -761,25 +755,51 @@ def srl_corrected_head(
 
     candidate_indices: list[int] = []
     for argument in target_arguments:
-        start = max(head_index, int(argument["start"]))
-        end = int(argument["end"])
-        for index in range(start, end + 1):
+        argument_start = int(argument["start"])
+        argument_end = int(argument["end"])
+        start = max(de_index + 1, argument_start)
+        end = argument_end
+        if any(
+            (
+                words[index] in COORDINATION_WORDS
+                or pos_tags[index] == "c"
+                or pos_tags[index] in PUNCTUATION_POS
+                or PUNCTUATION_PATTERN.fullmatch(words[index]) is not None
+            )
+            for index in range(start, end + 1)
+        ):
+            continue
+
+        # 指标词经常吸收前面的事件中心，例如“未关闭的管理升级数量”。
+        # 此时谓词真正作用于指标前最后一个内容中心，而不是“数量/率”。
+        if METRIC_HEAD_PATTERN.fullmatch(words[head_index]):
+            search_range = range(start, head_index)
+        else:
+            # 非指标短中心则向SRL目标论元右端提升，例如
+            # “关闭→管理”提升为“关闭→升级单”。
+            search_range = range(head_index + 1, end + 1)
+
+        local_candidates: list[int] = []
+        for index in search_range:
             if (
-                index > head_index
-                and is_content_head(
+                is_content_head(
                     words[index],
                     pos_tags[index],
                     segmentation_words,
                 )
                 and not METRIC_HEAD_PATTERN.fullmatch(words[index])
-                and follows_att_chain(
+                and not contains_boundary(
                     head_index,
                     index,
-                    heads,
-                    labels,
+                    words,
+                    pos_tags,
+                    include_de=True,
                 )
             ):
-                candidate_indices.append(index)
+                local_candidates.append(index)
+        if local_candidates:
+            candidate_indices.append(max(local_candidates))
+
     return max(candidate_indices) if candidate_indices else None
 
 
@@ -889,6 +909,90 @@ def build_atomic_att_repairs(
             continue
 
         corrected_head = None
+        # 属性词和紧邻的动词性名词同时ATT到更远中心时，优先保留
+        # “属性→局部事件→外层中心”的最短原子链。例如模型把
+        # “高风险→操作、变更→操作”平行输出时，前一条应局部化到
+        # “高风险→变更”。只处理相邻且共享中心的结构。
+        local_event_index = modifier_index + 1
+        if (
+            pos_tags[modifier_index] in ATTRIBUTE_POS
+            and local_event_index < head_index
+            and pos_tags[local_event_index].startswith("v")
+            and pos_tags[head_index].startswith("v")
+            and heads[local_event_index] - 1 == head_index
+            and labels[local_event_index] == "ATT"
+            and words[local_event_index] not in GENERIC_PREDICATE_WORDS
+            and not contains_boundary(
+                modifier_index,
+                head_index,
+                words,
+                pos_tags,
+                include_de=True,
+            )
+        ):
+            replaced_direct_keys.add((modifier_index, head_index))
+            anomalies.append(
+                {
+                    **item,
+                    "anomaly": "parallel_long_attribute",
+                    "reason": "属性词跨过相邻动词性名词平行挂到外层中心",
+                }
+            )
+            record_repair(
+                modifier_index,
+                local_event_index,
+                "local_attribute_head",
+                "high",
+                "属性词优先连接共享外层中心的相邻动词性名词",
+                "ATT",
+            )
+            continue
+
+        # “场景的风险项目数”一类结构中，显式“的”左侧修饰语可能
+        # 直接越过业务实体挂到指标词。若“的”后的非指标词本身直接
+        # ATT到该指标，选择最靠左的这一局部中心，避免仅凭词面猜测。
+        de_index = find_explicit_de(modifier_index, head_index, words)
+        if (
+            de_index is not None
+            and METRIC_HEAD_PATTERN.fullmatch(words[head_index])
+            and not pos_tags[modifier_index].startswith("v")
+        ):
+            metric_children = [
+                index
+                for index in range(de_index + 1, head_index)
+                if (
+                    heads[index] - 1 == head_index
+                    and labels[index] == "ATT"
+                    and is_content_head(
+                        words[index],
+                        pos_tags[index],
+                        segmentation_words,
+                    )
+                    and not METRIC_HEAD_PATTERN.fullmatch(words[index])
+                )
+            ]
+            if metric_children:
+                corrected_metric_head = min(metric_children)
+                replaced_direct_keys.add((modifier_index, head_index))
+                anomalies.append(
+                    {
+                        **item,
+                        "anomaly": "explicit_de_metric_head",
+                        "reason": (
+                            "显式“的”左侧修饰语越过局部实体挂到指标词"
+                        ),
+                    }
+                )
+                record_repair(
+                    modifier_index,
+                    corrected_metric_head,
+                    "explicit_de_metric_head",
+                    "high",
+                    "沿指标词的直接ATT子节点恢复显式“的”后的局部中心",
+                    "ATT",
+                )
+                continue
+
         # “不满客户声音”一类结构中，LTP可能输出“满→声音”，同时把
         # “客户”作为“满”的VOB。否定词+右侧宾语共同表明局部中心词
         # 应先落在宾语，再由宾语连接外层名词。
@@ -955,7 +1059,7 @@ def build_atomic_att_repairs(
                     **item,
                     "anomaly": "short_head",
                     "reason": (
-                        "SRL目标论元和ATT链表明中心词过短，"
+                        "SRL目标论元表明中心词过短或被指标词吸收，"
                         f"建议提升到{words[corrected_head]}"
                     ),
                 }
@@ -965,7 +1069,7 @@ def build_atomic_att_repairs(
                 corrected_head,
                 "srl_head_lift",
                 "high",
-                "显式“的”+SRL目标论元+ATT链共同支持中心词提升",
+                "显式“的”+SRL目标论元共同支持局部中心词提升",
                 "ATT",
             )
             continue
@@ -1128,6 +1232,303 @@ def build_atomic_att_repairs(
             f"SDP-{sdp_label}将左侧内容词识别为右侧中心词的语义特征",
             sdp_label,
         )
+
+    # LTP会把没有显式连词的紧凑复合短语误标成COO，例如把
+    # “服务订货”“管理升级”分析为并列。真正并列通常有“和/与/或/、”
+    # 等边界；无标记、相邻且至少一项为动词性名词时，按词序恢复局部
+    # 原子链。若两项同时挂到同一个更远中心，只保留“前项→后项→中心”
+    # 的局部结构，避免平行长边掩盖复合词内部关系。
+    for modifier_index, label in enumerate(labels):
+        if label != "COO":
+            continue
+        sibling_index = heads[modifier_index] - 1
+        if (
+            sibling_index < 0
+            or abs(modifier_index - sibling_index) != 1
+            or not (
+                pos_tags[modifier_index].startswith("v")
+                or pos_tags[sibling_index].startswith("v")
+            )
+            or words[modifier_index] in GENERIC_PREDICATE_WORDS
+            or words[sibling_index] in GENERIC_PREDICATE_WORDS
+        ):
+            continue
+        left_index = min(modifier_index, sibling_index)
+        right_index = max(modifier_index, sibling_index)
+        if (
+            not is_content_modifier(
+                words[left_index],
+                pos_tags[left_index],
+                segmentation_words,
+            )
+            or not is_content_head(
+                words[right_index],
+                pos_tags[right_index],
+                segmentation_words,
+            )
+            or any(
+                words[index] in COORDINATION_WORDS
+                or pos_tags[index] == "c"
+                for index in range(left_index + 1, right_index)
+            )
+        ):
+            continue
+
+        record_repair(
+            left_index,
+            right_index,
+            "unmarked_coordination_compound",
+            "high",
+            "相邻动词性内容词被误标为无连词并列，按词序恢复紧凑复合关系",
+            label,
+        )
+
+        for (existing_modifier, existing_head) in list(relations):
+            if (
+                existing_modifier == left_index
+                and existing_head > right_index
+                and (right_index, existing_head) in relations
+            ):
+                replaced_direct_keys.add(
+                    (existing_modifier, existing_head)
+                )
+                anomalies.append(
+                    {
+                        **relations[(existing_modifier, existing_head)],
+                        "anomaly": "unmarked_coordination_long_edge",
+                        "reason": (
+                            "无连词紧凑复合短语已有更局部的逐层中心关系"
+                        ),
+                    }
+                )
+
+    # SRL把连续片段整体识别为同一个核心论元时，如果相邻内容词被DEP
+    # 平行挂到论元外谓词，或平行挂到论元内的名词化谓词，说明局部定中
+    # 结构被外层谓词吸收。只在同一连续核心论元、相邻且共享依存中心时
+    # 恢复前项到后项，避免对普通句子相邻词无条件造边。
+    for frame in srl_by_predicate.values():
+        predicate_index = int(frame["index"])
+        for argument in frame["arguments"]:
+            if str(argument["role"]) not in {
+                "A0",
+                "A1",
+                "A2",
+                "A3",
+                "A4",
+                "A5",
+            }:
+                continue
+            argument_start = int(argument["start"])
+            argument_end = int(argument["end"])
+            if argument_start < 0 or argument_end >= len(words):
+                continue
+            for left_index in range(argument_start, argument_end):
+                right_index = left_index + 1
+                if (
+                    modifier_has_relation(left_index)
+                    or words[left_index] in COORDINATION_WORDS
+                    or words[right_index] in COORDINATION_WORDS
+                    or pos_tags[left_index] == "c"
+                    or pos_tags[right_index] == "c"
+                    or words[left_index] in NEGATION_WORDS
+                    or words[right_index] in NEGATION_WORDS
+                    or words[right_index] in GENERIC_PREDICATE_WORDS
+                    or right_index == predicate_index
+                    or not is_content_modifier(
+                        words[left_index],
+                        pos_tags[left_index],
+                        segmentation_words,
+                    )
+                    or not is_content_head(
+                        words[right_index],
+                        pos_tags[right_index],
+                        segmentation_words,
+                    )
+                ):
+                    continue
+
+                shared_head = heads[left_index] - 1
+                if shared_head < 0 or heads[right_index] - 1 != shared_head:
+                    continue
+                shared_external_predicate = (
+                    shared_head == predicate_index
+                    and not (
+                        argument_start
+                        <= predicate_index
+                        <= argument_end
+                    )
+                    and pos_tags[right_index].startswith("v")
+                )
+                shared_internal_nominal_predicate = (
+                    argument_start
+                    <= shared_head
+                    <= argument_end
+                    and shared_head > right_index
+                    and pos_tags[shared_head].startswith("v")
+                    and labels[left_index] in {"SBV", "VOB", "FOB", "DBL"}
+                    and labels[right_index] in {"SBV", "VOB", "FOB", "DBL"}
+                    and (
+                        shared_head + 1 >= len(words)
+                        or words[shared_head + 1] != "的"
+                    )
+                )
+                if not (
+                    shared_external_predicate
+                    or shared_internal_nominal_predicate
+                ):
+                    continue
+                record_repair(
+                    left_index,
+                    right_index,
+                    "srl_argument_compound",
+                    "medium",
+                    (
+                        "相邻内容词属于同一SRL核心论元且被DEP平行挂到"
+                        "同一谓词，恢复论元内部局部修饰"
+                    ),
+                    labels[left_index],
+                )
+
+    # 在SRL核心论元内部，“名词 + 名词化动词 + 名词中心”常被分析为
+    # 主谓结构。若左词直接依存到紧邻右侧谓词，且右侧没有“的”引出
+    # 关系从句，则保留局部名词化修饰；显式关系从句仍交给SRL恢复。
+    for frame in srl_by_predicate.values():
+        for argument in frame["arguments"]:
+            if str(argument["role"]) not in {
+                "A0",
+                "A1",
+                "A2",
+                "A3",
+                "A4",
+                "A5",
+            }:
+                continue
+            argument_start = int(argument["start"])
+            argument_end = int(argument["end"])
+            for left_index in range(argument_start, argument_end):
+                right_index = left_index + 1
+                if (
+                    modifier_has_relation(left_index)
+                    or heads[left_index] - 1 != right_index
+                    or labels[left_index] not in {"SBV", "VOB", "FOB", "DBL"}
+                    or not pos_tags[right_index].startswith("v")
+                    or words[right_index] in GENERIC_PREDICATE_WORDS
+                    or any(
+                        words[index] == "的"
+                        for index in range(
+                            right_index + 1,
+                            argument_end + 1,
+                        )
+                    )
+                    or not is_content_modifier(
+                        words[left_index],
+                        pos_tags[left_index],
+                        segmentation_words,
+                    )
+                ):
+                    continue
+                record_repair(
+                    left_index,
+                    right_index,
+                    "srl_nominalized_predicate",
+                    "medium",
+                    "SRL核心论元内名词紧邻名词化谓词，恢复局部修饰关系",
+                    labels[left_index],
+                )
+
+    # 动词性名词与右侧名词宾语同时位于同一个SRL核心论元时，DEP常把
+    # “交付 EI 项目”分析成普通“交付→项目”谓宾。若二者之间只有直接
+    # ATT到该名词的紧凑修饰语，则将其保留为名词化复合关系；跨“的”、
+    # 连词、标点或核心论元边界时不触发。
+    for frame in srl_by_predicate.values():
+        for argument in frame["arguments"]:
+            if str(argument["role"]) not in {
+                "A0",
+                "A1",
+                "A2",
+                "A3",
+                "A4",
+                "A5",
+            }:
+                continue
+            argument_start = int(argument["start"])
+            argument_end = int(argument["end"])
+            for verb_index in range(argument_start, argument_end):
+                if (
+                    not pos_tags[verb_index].startswith("v")
+                    or words[verb_index] in GENERIC_PREDICATE_WORDS
+                    or labels[verb_index] == "HED"
+                ):
+                    continue
+                noun_children = [
+                    index
+                    for index in range(verb_index + 1, argument_end + 1)
+                    if (
+                        heads[index] - 1 == verb_index
+                        and labels[index] in {"VOB", "FOB", "DBL"}
+                        and (
+                            pos_tags[index].startswith("n")
+                            or pos_tags[index] == "ws"
+                        )
+                        and all(
+                            (
+                                heads[between] - 1 == index
+                                and labels[between] == "ATT"
+                            )
+                            for between in range(verb_index + 1, index)
+                        )
+                        and not contains_boundary(
+                            verb_index,
+                            index,
+                            words,
+                            pos_tags,
+                            include_de=True,
+                        )
+                        and not any(
+                            words[after] == "的"
+                            for after in range(index + 1, argument_end + 1)
+                        )
+                    )
+                ]
+                if not noun_children:
+                    continue
+                noun_index = min(noun_children)
+                record_repair(
+                    verb_index,
+                    noun_index,
+                    "srl_verbal_nominal_object",
+                    "medium",
+                    (
+                        "动词性名词及其紧凑名词宾语位于同一SRL核心论元，"
+                        "保留名词化复合关系"
+                    ),
+                    labels[noun_index],
+                )
+
+                # 若前置属性词只是因为同挂外层谓词而临时连接到该
+                # 动词性名词，最终中心不是指标词时，将属性投射到实体
+                # 中心，避免把局部事件链当成最终实体修饰。
+                for (attribute_index, event_index), relation in list(
+                    relations.items()
+                ):
+                    if (
+                        event_index != verb_index
+                        or relation["source"] != "srl_argument_compound"
+                        or pos_tags[attribute_index] not in ATTRIBUTE_POS
+                        or METRIC_HEAD_PATTERN.fullmatch(words[noun_index])
+                    ):
+                        continue
+                    replaced_direct_keys.add(
+                        (attribute_index, event_index)
+                    )
+                    record_repair(
+                        attribute_index,
+                        noun_index,
+                        "srl_attribute_entity_projection",
+                        "medium",
+                        "SRL紧凑论元中的属性词投射到名词化事件的实体中心",
+                        str(relation.get("original_label") or ""),
+                    )
 
     # 保留否定极性。它不是传统 DEP-ATT，但对“未关闭、不健康”等业务
     # 状态不可丢失，因此作为语义原子关系输出。
