@@ -170,7 +170,10 @@ def classify_atomic_att(
     ):
         return "过滤", "日历内部修饰", False
 
-    if head_pos in QUESTION_OR_QUANTITY_POS:
+    if (
+        head not in segmentation_words
+        and head_pos in QUESTION_OR_QUANTITY_POS
+    ):
         return "过滤", f"中心词为疑问或数量词/{head_pos}", False
 
     if (

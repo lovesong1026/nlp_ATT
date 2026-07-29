@@ -12,6 +12,7 @@ cws（分词前置）+ pos + dep
 2. 运行 `LTP/base` 的 `cws + pos + dep`。
 3. 只读取 DEP 标签为 `ATT` 的原子定中关系。
 4. 使用 POS 和词面规则过滤时间、数量、疑问、指示和结构词等明显噪声。
+   自定义词典中的中心词不因 POS 被误标为 `m/q` 而过滤。
 5. 同时输出原始 ATT、POS 判定和过滤后的原子 ATT。
 
 ## 本阶段不做什么
@@ -41,7 +42,7 @@ cws（分词前置）+ pos + dep
 ## 当前配置
 
 - 模型：`LTP/base`
-- 共享词典：项目根目录 `segmentation_words.txt`，66词
+- 共享词典：项目根目录 `segmentation_words.txt`，当前15词
 - 自定义词频：`freq=2`
 - 输入：`data/original_question.md`
 - 输出：`original_question_attributives_pos_dep.md`

@@ -1,530 +1,586 @@
-# 业务 RAG 定语提取技术路线
+# 业务 RAG 定语抽取技术路线
 
 ## 1. 项目目标
 
-本项目从中文业务问题中提取对 RAG 检索有价值的定语（ATT），用于补充业务对象的限定信息。
-
-最终结果重点保留：
-
-- 等级：`A级 → 项目`
-- 风险：`高风险 → 项目`
-- 状态：`假设未关闭的 → 项目`
-- 业务类型：`交付 → 项目`
-- 完整原因从句：`产品质量导致的 → 网上事故`
-- 完整关联从句：`设备增量相关的 → 收入`
-- 业务专名：`NPX → 保障`、`EI → 项目`
-- 指标构成：`管理 → 成熟度`
-
-最终结果不保留：
-
-- 时间内部关系：`2026年 → 5月`
-- 数量和疑问成分：`多少 → 个`
-- 指示和上下文数量：`这两个 → 事故`
-- 已由维度抽取阶段删除的地域、组织、产品等维度
-- 只有功能词、缺少业务内容的关系：`导致 → 项目`
-- 语义改写或原句中不存在的标签
-
-## 2. 核心原则
-
-### 2.1 高召回与高精度分层
-
-LTP 负责高召回地产生句法候选，Qwen 负责业务相关性判断，程序规则负责最终硬校验。
-
-不要求单一模型同时完成分词、句法分析、业务判断和结果约束。
-
-### 2.2 分析原始句，输出保留句
-
-- 使用 `data/original_question.md` 的完整问题理解句法和业务语义。
-- 使用 `data/dimension_extracted_question.md` 确定已经抽取的维度。
-- 最终 ATT 的修饰语和中心词必须仍然存在于维度抽取后的句子中。
-
-### 2.3 不做语义改写
-
-`modifier_text`、`modifier_core` 和 `head_text` 必须逐字来自原句。
-
-例如：
+本项目从中文业务问句中提取对 RAG 检索有价值的完整定语关系：
 
 ```text
-原句：产品质量导致的网上事故
-正确：产品质量导致的 → 网上事故
-错误：事故原因=产品质量
+modifier_text → head_text
 ```
 
-### 2.4 完整从句与直接关系并存
+其中：
 
-- 普通复合名词保留逐层直接 ATT。
-- “的”字原因、关联、状态从句保留完整连续文本。
+- `modifier_text`：能够缩小检索范围的状态、原因、关联、动作、属性、
+  领属或分类条件；
+- `head_text`：承接定语、表示查询对象的业务实体短语；
+- 两端都必须是原句中的连续片段，不补词、不调序、不做同义改写；
+- 已由上游维度抽取删除的地域、组织、产品等内容，不得重新进入结果。
 
-例如：
+示例：
 
 ```text
-NPX保障项目：
-NPX → 保障
-保障 → 项目
+产品质量导致的 → 网上事故
+假设未关闭的 → A级交付EI项目
+由于物料供应问题导致的 → 风险交付项目
+```
 
-由于物料供应原因导致的风险交付项目：
-由于物料供应原因导致的 → 项目
+以下内容通常不作为 RAG 定语：
+
+```text
+2026年 → 5月
+多少 → 个
+这两个 → 二级事故
+导致 → 网上事故
+```
+
+## 2. 核心定义
+
+### 2.1 原子 ATT
+
+LTP 依存句法中标签为 `ATT` 的直接定中边：
+
+```text
+导致 → 事故
 交付 → 项目
 ```
 
-## 3. 总体架构
+原子 ATT 可解释、召回高，但不一定具有完整业务语义。
+
+### 2.2 完整业务定语
+
+能够独立表达业务限制条件的原句连续片段：
 
 ```text
-原始问题
-   │
-   ├── SEGMENTATION_WORDS 领域分词保护
-   │
-   ▼
+产品质量导致的 → 网上事故
+```
+
+它可能由多个 DEP/SRL 片段组合而来，也可能是 LLM 从原句补充的遗漏。
+
+### 2.3 业务实体
+
+用户实际查询、计数、列举或判断的业务对象，也是最终关系的中心词：
+
+```text
+中风险 → 交付项目
+```
+
+其中 `交付项目` 是业务实体，`中风险` 是业务定语。
+
+业务实体不等同于传统 NER 中的人名、地名或机构名。当前实现要求
+`head_text` 必须逐字等于模型识别的某个业务实体。
+
+### 2.4 排除维度
+
+`data/dimension_extracted_question.md` 是
+`data/original_question.md` 经维度抽取后的对应结果。程序通过二者的字符
+差异，将已删除内容映射成原句中的禁止区间。
+
+第五阶段仍分析完整原句，但最终定语和中心词不能与禁止区间重叠。
+
+## 3. 当前总体架构
+
+```text
+data/original_question.md
+        │
+        ├────────────────────────────────────────────┐
+        │                                            │
+        ▼                                            ▼
+第1阶段：LTP七任务基线                    dimension_extracted_question.md
+cws/pos/ner/srl/dep/sdp/sdpg                       │
+        │                                            │
+        ▼                                            │
+第2阶段：加入最小分词词典                           │
+验证词典对七任务的连锁影响                           │
+        │                                            │
+        ▼                                            │
+第3阶段：POS + DEP                                  │
+抽取并过滤原子 ATT                                  │
+        │                                            │
+        ▼                                            │
+第4阶段：POS + DEP + SRL                            │
+解释并恢复动词性完整定语                             │
+        │                                            │
+        └──────────────────┬─────────────────────────┘
+                           ▼
+第5阶段：qwen-plus
+识别业务实体，筛选、修剪、合并、补漏
+                           │
+                           ▼
+Schema + 原文跨度 + 维度区间硬校验
+                           │
+                           ▼
+可用于业务 RAG 的完整定语关系
+```
+
+总体原则：
+
+1. 原句是唯一事实来源。
+2. LTP、POS、DEP、SRL 只提供可错、可缺失的候选证据。
+3. LLM 负责业务语义裁决，不负责创造原句中不存在的文本。
+4. 程序负责确定性约束，不能把所有质量判断交给提示词。
+5. SDP、SDPG、NER 当前只用于第一、二阶段观察，不进入正式抽取链路。
+
+## 4. 共享配置
+
+### 4.1 LTP 模型
+
+第1至第4阶段默认使用：
+
+```text
 LTP/base
-   │
-   ├── 中文分词
-   ├── 依存句法
-   └── 原始 ATT
-   │
-   ▼
-完整定语候选重建
-   │
-   ├── token 字符区间对齐
-   ├── “的”字定语子树合并
-   ├── 原因/关联/状态从句重建
-   └── “项目是由于……导致的”后置条件识别
-   │
-   ▼
-LTP 完整候选 JSONL
-   │
-   ├── 对齐 dimension_extracted_question
-   ├── 计算 excluded_dimensions
-   └── 程序预删除时间、数量和已抽取维度
-   │
-   ▼
-Qwen-plus v4
-   │
-   ├── keep：保留有效候选
-   ├── drop：删除无效候选
-   └── add：补充明确漏项
-   │
-   ▼
-Schema 与硬规则校验
-   │
-   ├── 原句字符区间校验
-   ├── 目标句字符区间校验
-   ├── 业务专名保护
-   ├── 指标构成保护
-   ├── 补项形态校验
-   └── 重复和内部冗余校验
-   │
-   ▼
-最终业务 RAG ATT
 ```
 
-## 4. 第一阶段：LTP 候选生成
-
-核心代码：
-
-- `extract_attributives_ltp.py`
-
-### 4.1 领域分词保护
-
-`SEGMENTATION_WORDS` 保存最小不可拆业务单元，例如：
-
-```text
-产品质量
-物料供应
-网上事故
-高风险
-NPX
-EI
-EHS
-Facility
-SmartCare
-```
-
-词典只用于保护分词，不直接决定 ATT 关系。
-
-不应加入需要继续分析内部结构的完整长指标，例如：
-
-```text
-服务收入完成率
-网络变更操作成功率
-```
-
-### 4.2 字符区间对齐
-
-LTP 返回 token 和依存关系后，将每个 token 按顺序定位回原句，保存：
-
-```json
-{
-  "text": "NPX",
-  "start": 12,
-  "end": 15,
-  "head": 8,
-  "label": "ATT"
-}
-```
-
-后续所有结果都通过字符区间校验，防止模型改写或错位。
-
-### 4.3 完整定语重建
-
-对带“的”的 ATT 核心，基于依存子树向左收集主语、宾语、状语和补语：
-
-```text
-导致 → 项目
-```
-
-重建为：
-
-```text
-由于物料供应原因导致的 → 项目
-```
-
-重建过程中：
-
-- 遇到 `由于`、`由`，从介词标记开始截取。
-- 遇到标点停止跨句扩展。
-- 在 `全球、运营商、业务、地区部` 等范围词处停止扩展。
-- 删除 `这、两、多少、个` 等低价值成分。
-- 所有完整修饰语都直接截取原句连续字符。
-
-### 4.4 后置条件识别
-
-LTP 不一定会把下面的原因条件标记成 ATT：
-
-```text
-项目是由于解决方案问题导致的
-```
-
-程序通过“实体 + 是 + 原因从句”的依存结构补充：
-
-```text
-由于解决方案问题导致的 → 项目
-```
-
-### 4.5 运行命令
+运行环境：
 
 ```bash
-python extract_attributives_ltp.py \
-  data/original_question.md \
-  output/original_question_attributives_ltp_reconstructed.md \
-  --model LTP/base \
-  --use-segmentation-words \
-  --reconstruct-modifiers \
-  --jsonl-output output/original_question_attributives_ltp_reconstructed.jsonl
+conda activate minimind
 ```
 
-### 4.6 第一阶段输出
+### 4.2 最小分词词典
 
-- `output/original_question_attributives_ltp_reconstructed.md`
-- `output/original_question_attributives_ltp_reconstructed.jsonl`
-
-JSONL 保存：
-
-- 原文件行号
-- 原句
-- token 和字符区间
-- 依存关系
-- LTP 原始 ATT
-- 完整定语候选
-
-## 5. 第二阶段：业务 RAG 筛选
-
-核心代码：
-
-- `filter_attributives_rag.py`
-
-当前提示词版本：
+项目根目录：
 
 ```text
-rag_candidate_filter_v4
+segmentation_words.txt
 ```
 
-当前模型：
+词典当前保留 15 个容易被错误切分、且切分后可能改变业务含义或干扰句法
+分析的最小词。默认注册词频：
+
+```text
+freq=2
+```
+
+词典只保护 CWS 分词边界，不直接决定 POS、DEP、SRL 或最终定语关系。
+普通英文缩写和 LTP 已能稳定处理的组合词不进入词典，以降低对后续任务的
+连锁干扰。
+
+## 5. 第1阶段：无词典 LTP 七任务基线
+
+目录：
+
+```text
+1.extract_ltp_all_tasks/
+```
+
+任务：
+
+```text
+cws + pos + ner + srl + dep + sdp + sdpg
+```
+
+目的：
+
+- 查看 LTP 对原始问句的完整输出；
+- 建立无自定义词典的对照基线；
+- 分析分词变化对 POS、DEP、SRL 等下游任务的影响。
+
+运行：
+
+```bash
+conda run -n minimind python \
+  "1.extract_ltp_all_tasks/extract_ltp_all_tasks.py" \
+  "data/original_question.md" \
+  "1.extract_ltp_all_tasks/original_question_ltp_all_tasks.md"
+```
+
+本阶段不抽取最终业务定语。
+
+## 6. 第2阶段：自定义词典 LTP 七任务
+
+目录：
+
+```text
+2.extract_ltp_all_tasks_自定义词典/
+```
+
+在第1阶段基础上加载 `segmentation_words.txt`，再次运行全部七项任务。
+
+运行：
+
+```bash
+conda run -n minimind python \
+  "2.extract_ltp_all_tasks_自定义词典/extract_ltp_all_tasks_custom_dict.py" \
+  "data/original_question.md" \
+  "2.extract_ltp_all_tasks_自定义词典/original_question_ltp_all_tasks_custom_dict.md"
+```
+
+本阶段的目标不是“词越多越好”，而是通过与第1阶段对比，保留最小且必要的
+分词干预。例如，词典改变 token 边界后，SRL 可能不再识别原有谓词，因此
+每次修改词典后都需要重新观察 POS、DEP 和 SRL。
+
+## 7. 第3阶段：POS + DEP 原子 ATT
+
+目录：
+
+```text
+3.extract_attributives_pos_dep/
+```
+
+任务：
+
+```text
+cws + pos + dep
+```
+
+处理逻辑：
+
+1. 使用共享分词词典；
+2. 只读取 DEP 标签为 `ATT` 的直接关系；
+3. 使用 POS 和词面规则过滤时间、数量、疑问、指示和结构词噪声；
+4. 自定义词典中的中心词不因被误标为 `m/q` 而过滤；
+5. 输出原始 ATT、POS 判定和最终原子 ATT。
+
+本阶段刻意不做：
+
+- 完整定语重建；
+- 中心词提升；
+- 关系链合并；
+- 维度过滤；
+- LLM 业务判断。
+
+运行：
+
+```bash
+conda run -n minimind python \
+  "3.extract_attributives_pos_dep/extract_attributives_pos_dep.py" \
+  "data/original_question.md" \
+  "3.extract_attributives_pos_dep/original_question_attributives_pos_dep.md"
+```
+
+当前全量结果：
+
+```text
+问题：389 条
+原子 ATT：1270 条
+包含 ATT 的问题：377 条
+```
+
+原子 ATT 是高召回候选，不应直接作为 RAG 最终元数据。
+
+## 8. 第4阶段：SRL 辅助动词性定语恢复
+
+目录：
+
+```text
+4.recover_verbal_attributives_srl/
+```
+
+任务：
+
+```text
+cws + pos + dep + srl
+```
+
+职责：
+
+- DEP 确定“哪个动词修饰哪个中心词”；
+- POS 将恢复范围限制在动词性 ATT；
+- SRL 匹配同一 token 的谓词，并提供 A0、A1、原因、否定、方式等论元；
+- 原句字符区间决定最终片段；
+- “的”只作为显式边界和置信信号，不是唯一触发条件。
+
+示例：
+
+```text
+DEP：导致 → 项目
+SRL：ARGM-PRP=由于物料供应原因，A1=项目
+恢复：由于物料供应原因导致的 → 项目
+```
+
+恢复结果按证据分为：
+
+- `high`：显式“的”且具有中心词证据；
+- `medium`：只有其中一类强信号；
+- `low`：有连续候选但证据不足，只保留审计；
+- `unresolved`：SRL 谓词缺失、没有有效论元或范围不合法。
+
+只有 `high/medium` 进入“接受的动词定语”。恢复失败时保留第三阶段的原子
+ATT，不启用 DEP 子树 fallback。
+
+运行：
+
+```bash
+conda run -n minimind python \
+  "4.recover_verbal_attributives_srl/extract_verbal_attributives_srl.py" \
+  "data/original_question.md" \
+  "4.recover_verbal_attributives_srl/original_question_verbal_attributives_srl.md"
+```
+
+当前全量结果：
+
+```text
+动词 ATT 候选：366 条
+SRL 连续候选：72 条
+接受恢复：55 条
+第四阶段完整结果：1270 条关系
+```
+
+第四阶段仍然不做业务价值判断、维度过滤和最终关系合并。
+
+## 9. 第5阶段：LLM 业务语义裁决
+
+目录：
+
+```text
+5.extract_attributives_llm/
+```
+
+模型：
 
 ```text
 qwen-plus
 ```
 
-### 5.1 数据对齐
-
-按照原文件行号对齐：
-
-- LTP JSONL 中的完整原句
-- `dimension_extracted_question.md` 中的维度抽取后问题
-
-通过字符序列差异计算 `excluded_dimensions`。
-
-如果维度抽取后的行为空或文件末尾缺少对应行，按“该句已全部抽取”处理，最终 ATT 为空，不与下一行错位。
-
-### 5.2 程序预过滤
-
-调用 Qwen 前，程序先删除：
-
-- 不在目标句中的修饰语或中心词
-- 时间表达
-- 数量和疑问成分
-- 只有功能词的候选
-- 已抽取维度覆盖的候选
-
-Qwen 只处理字符区间合法的剩余候选。
-
-### 5.3 Qwen 的职责
-
-Qwen 对每个候选执行：
+当前提示词版本：
 
 ```text
-keep：保留为业务 RAG ATT
-drop：删除低价值、错误或冗余候选
-add：补充 LTP 明确漏掉的直接 ATT
+stage5-v9
 ```
 
-模型不能使用 `excluded_dimension` 删除已经通过预过滤的候选。
+### 9.1 输入
 
-`keep` 必须使用：
+每条问题同时输入：
 
-```text
-business_constraint
-```
+- 完整原句；
+- 维度抽取后的句子与禁止字符区间；
+- 第3阶段原子 ATT，编号为 `A1、A2...`；
+- 第4阶段 SRL 连续候选，编号为 `S1、S2...`；
+- 第4阶段 DEP 动词 ATT，编号为 `V1、V2...`。
 
-### 5.4 补项约束
+`A/S/V` 都是证据，不是标准答案。LLM 可以接受、拒绝、修剪和合并候选，
+也可以直接从原句补充候选未覆盖的关系。
 
-LLM 补项只允许两类：
+### 9.2 LLM 职责
 
-1. 单个 LTP token 修饰最小名词中心词。
-2. 完整的原因、关联或状态定语从句。
+1. 识别被查询、计数、列举或判断的业务实体；
+2. 只保留能改善 RAG 检索的完整定语；
+3. 合并低价值原子边；
+4. 恢复原因、状态、关联、动作等动词性定语；
+5. 处理后置条件；
+6. 对证据不足的句子主动放弃。
 
-允许：
+### 9.3 程序硬校验
 
-```text
-EI → 项目
-EHS → 管理
-产品质量导致的 → 网上事故
-```
+模型返回后，程序继续验证：
 
-禁止：
+- 批次 ID 完整且不重复；
+- JSON 符合 Pydantic Schema；
+- 定语和中心词均为原句连续片段；
+- 定语和中心词不能重叠；
+- 中心词必须等于模型识别的一个业务实体；
+- 关系不能跨越标点；
+- 关系不能与排除维度区间重叠；
+- 时间、数量、疑问、指示和空泛谓词不能作为定语；
+- 不存在的证据 ID 会被移除并记录。
 
-```text
-销毛率 → 销毛率
-解决方案问题 → 导致的
-高危网络变更操作 → 操作
-业务的 → 成本率
-```
+单条关系校验失败不会阻塞同批次其他句子。批次结构错误会自动重试；批次
+持续失败时降级为逐句请求。每个成功结果都会写入 JSONL 缓存，支持断点
+续跑。
 
-补项还必须满足：
+### 9.4 环境
 
-- 修饰语与中心词不能相同。
-- 中心词不能包含在修饰语中。
-- 修饰语和中心词之间不能跨越谓语。
-- 不能添加完整从句内部的冗余关系。
-- 不能添加已有候选的重复关系。
-- 不能使用泛化范围词作为补项。
-
-### 5.5 业务专名保护
-
-以下词只要仍存在于目标句中，就不能被模型错误删除：
-
-```text
-NPX、EHS、EI、ITS、NIS、SEC、AMS、MBB、FBB、
-IT、DC、5G、P3、H1、TOP3、Facility、SmartCare
-```
-
-例如：
-
-```text
-NPX保障项目
-→ NPX → 保障
-→ 保障 → 项目
-```
-
-### 5.6 指标构成保护
-
-中心词以“率”或“度”结尾时，业务构成关系受到程序保护，例如：
-
-```text
-收入 → 完成率
-管理 → 成熟度
-风险 → 超期未关闭率
-```
-
-### 5.7 运行命令
-
-运行前需要激活包含依赖的 Python 环境，并在 `.env` 中配置：
+`.env`：
 
 ```text
 DASHSCOPE_API_KEY=...
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
-执行：
+安装依赖：
 
 ```bash
-python filter_attributives_rag.py \
-  output/original_question_attributives_ltp_reconstructed.jsonl \
-  data/dimension_extracted_question.md \
-  output/original_question_attributives_rag_filtered.md \
-  --jsonl-output output/original_question_attributives_rag_filtered.jsonl \
-  --batch-size 8
+conda run -n minimind pip install -r requirements-llm.txt
 ```
 
-### 5.8 缓存与断点续跑
+`.env` 和 `.cache` 均禁止提交到 Git。
 
-每个成功批次都会写入：
+### 9.5 运行
 
-```text
-output/.cache/
+只检查输入对齐，不调用 API：
+
+```bash
+conda run -n minimind python \
+  "5.extract_attributives_llm/extract_attributives_llm.py" \
+  "data/original_question.md" \
+  "5.extract_attributives_llm/original_question_attributives_llm.md" \
+  --dry-run
 ```
 
-缓存签名包含：
+运行固定验证集：
 
-- 提示词版本
-- 模型
-- 原句
-- 目标句
-- 已排除维度
-- 候选内容
-
-输入或提示词版本变化后，旧缓存不会被错误复用。
-
-## 6. 最终输出结构
-
-Markdown：
-
-```text
-原文件行号
-原始问题
-维度抽取后问题
-已排除维度
-最终 ATT
+```bash
+conda run -n minimind python \
+  "5.extract_attributives_llm/extract_attributives_llm.py" \
+  "data/original_question.md" \
+  "5.extract_attributives_llm/validation_10.md" \
+  --line-ids 42,50,84,118,150,214,309,336,366,388
 ```
 
-JSONL 额外保存：
+全量运行：
 
-- 候选数量
-- keep/drop 决策
-- 接受的 LLM 补项
-- 被硬规则拒绝的补项及原因
-- 最终 ATT
-- 原始句和目标句字符区间
-- 候选来源
-
-候选来源包括：
-
-```text
-ltp_token
-ltp_subtree
-ltp_copular_clause
-llm_addition
+```bash
+conda run --no-capture-output -n minimind python \
+  "5.extract_attributives_llm/extract_attributives_llm.py" \
+  "data/original_question.md" \
+  "5.extract_attributives_llm/original_question_attributives_llm.md" \
+  --workers 2
 ```
 
-## 7. 当前全量结果
+默认批大小为 4、温度为 0。缓存指纹包含提示词版本、模型、原句、维度区间
+和全部候选证据；输入或提示词变化后不会误用旧缓存。
 
-数据规模：
+## 10. 当前全量结果
+
+输入情况：
 
 ```text
-389 句
+有效问题：389 条
+维度结果可用：360 条
+维度结果不可用：29 条
+排除维度区间：359 个
 ```
 
-v4 全量结果：
+第五阶段结果：
 
 ```text
-最终 ATT：452 条
-存在有效 ATT 的句子：284 条
-接受 LLM 补项：27 条
-硬校验拒绝补项：58 条
-维度抽取后为空：29 句
-字符区间错误：0
+完成度：389/389
+包含业务定语的问题：138 条
+无业务定语的问题：251 条
+最终业务定语关系：144 条
 ```
 
-API 用量：
+关系类型：
 
 ```text
-输入：124,200 tokens
-输出：30,970 tokens
+cause：44
+state：39
+association：33
+classification：16
+possessive：7
+action：5
 ```
 
-正式结果：
-
-- `output/original_question_attributives_rag_filtered.md`
-- `output/original_question_attributives_rag_filtered.jsonl`
-
-## 8. 典型结果
+置信度：
 
 ```text
-由于物料供应原因导致的 → 项目
+high：136
+medium：8
+```
+
+本次全量 API 用量：
+
+```text
+输入：251552 tokens
+输出：46797 tokens
+```
+
+正式输出：
+
+```text
+5.extract_attributives_llm/original_question_attributives_llm.md
+```
+
+## 11. 典型数据流
+
+原句：
+
+```text
+全球运营商业务产品质量导致的网上事故有多少个
+```
+
+维度禁止区间：
+
+```text
+全球运营商
+```
+
+第三阶段：
+
+```text
+业务 → 产品
+产品 → 质量
+导致 → 事故
+网上 → 事故
+```
+
+第四阶段：
+
+```text
+全球运营商业务产品质量导致的 → 事故
+```
+
+第五阶段去除查询作用域并提升中心词：
+
+```text
 产品质量导致的 → 网上事故
-未及时恢复的 → 网上事故
-设备增量相关的 → 收入
-二级事故的 → 根因
-假设未关闭的 → 项目
-A级 → 项目
-EI → 项目
-NPX → 保障
-保障 → 项目
-EHS → 管理
-管理 → 成熟度
-SmartCare → 场景
 ```
 
-## 9. 已知边界
+最终文本仍全部逐字来自原句。
 
-### 9.1 依存句法误差
+## 12. 已知边界
 
-LTP 仍可能把业务复合词分析为主谓、动宾或兼语关系，导致漏掉直接 ATT。
+### 12.1 业务实体边界仍会导致漏抽
 
-当前通过：
+当前要求 `head_text` 必须完全等于某个业务实体。这能阻止过短中心词，但
+模型把“定语 + 实体”整体识别为实体时，会错误过滤语义正确的关系。
 
-- 领域分词
-- 完整从句重建
-- Qwen 补项
-- 业务专名保护
-
-降低影响，但不能完全消除。
-
-### 9.2 维度抽取质量会影响最终 ATT
-
-如果 `dimension_extracted_question.md` 删除过多内容，程序会按要求禁止这些字符出现在最终 ATT 中。
-
-因此维度抽取阶段与 ATT 阶段需要共同评估。
-
-### 9.3 LLM 业务判断仍可能波动
-
-提示词、Schema 和硬规则已经限制输出，但 `keep/drop` 仍包含模型判断。
-
-缓存可保证同一批结果稳定复用；提示词升级时应重新运行代表性测试集。
-
-### 9.4 尚未建立人工金标准
-
-当前质量主要通过关键样例和程序一致性校验评估。
-
-程序校验能够保证：
-
-- 不改写
-- 不越过排除维度
-- 字符区间正确
-- 补项形态合法
-
-但不能完全替代业务专家对“是否值得用于 RAG”的判断。
-
-## 10. 建议的下一阶段
-
-建立 50 至 100 句人工标注评测集，覆盖：
-
-- 原因从句
-- 关联从句
-- 状态定语
-- 等级和风险
-- 业务缩写
-- 复合指标
-- 已抽取维度
-- 省略和歧义句
-
-建议计算：
+当前已观察到：
 
 ```text
-候选召回率
-最终 ATT 精确率
-最终 ATT 召回率
-完全匹配率
-错误维度泄漏率
-LLM 补项接受率
+未关闭的 → 管理升级单
+重大或高风险 → 交付EI项目
+中风险 → 交付项目
 ```
 
-在人工评测稳定后，再将最终 ATT 作为 RAG 元数据字段写入索引。
+需要改进实体识别和关系切分，而不是简单删除重叠校验。
+
+### 12.2 维度结果不可用时约束较弱
+
+维度文件空行或末尾缺失时，程序按“不可用”处理，不会把整句误当成已删除
+维度。但这也意味着只能依靠提示词排除时间和查询范围。
+
+当前仍存在把带时间或范围的长片段误判为定语的风险，例如需要重点复核
+原文件第 390 行。
+
+### 12.3 LTP 候选受分词影响
+
+自定义词典改变 token 边界后，POS、DEP、SRL 都可能变化。词典只能保留
+最小必要词，不适合扩展成完整业务术语表。
+
+### 12.4 还没有人工金标准
+
+当前质量主要依靠程序约束和典型样例检查。144 条关系并不等于已经达到可
+上线精度；在写入 RAG 索引前仍需要人工标注评测。
+
+## 13. 下一步建议
+
+优先级建议：
+
+1. 建立 50–100 条人工金标准，覆盖普通 ATT、动词性定语、后置条件、
+   多层实体、维度删除和无有效定语；
+2. 将“业务实体”进一步拆分为核心实体、完整实体短语和指标，避免
+   `国家/国家数量`、`项目/交付EI项目`混为一层；
+3. 修正实体边界造成的三类已知漏抽，并为硬校验添加单元测试；
+4. 为维度结果不可用的情况增加确定性时间/查询范围校验；
+5. 计算关系级 Precision、Recall、F1、整句完全匹配率和维度泄漏率；
+6. 评测稳定后，再将最终关系写入 RAG 的结构化元数据。
+
+## 14. 设计结论
+
+当前路线的核心不是让某一个模型完成全部任务，而是分层承担风险：
+
+```text
+最小词典保证分词边界
+        +
+POS/DEP提供可解释的高召回原子关系
+        +
+SRL恢复动词论元和连续片段
+        +
+LLM判断业务价值、合并和补漏
+        +
+Schema与字符区间规则保证输出边界
+```
+
+这种设计比直接使用 DEP 原子边更符合业务 RAG 需求，也比完全依赖 LLM
+更容易审计、定位错误和重复运行。
