@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,14 @@ from ltp import LTP
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SEGMENTATION_DICTIONARY = PROJECT_ROOT / "segmentation_words.txt"
+DEFAULT_DIMENSION_INPUT = (
+    PROJECT_ROOT / "data/dimension_extracted_question.md"
+)
+MERGE_RULES_SCRIPT = (
+    PROJECT_ROOT
+    / "4.1.merge_atomic_modifier_relations"
+    / "merge_atomic_modifier_relations.py"
+)
 
 QUESTION_OR_QUANTITY_POS = {"r", "m", "q"}
 PUNCTUATION_POS = {"wp"}
@@ -121,6 +131,19 @@ def display_project_path(path: Path) -> str:
         return path.as_posix()
 
 
+def load_merge_rules_module() -> Any:
+    """加载第4.1阶段的确定性合并规则，避免复制两套实现。"""
+    spec = importlib.util.spec_from_file_location(
+        "stage4_1_merge_atomic_modifier_relations",
+        MERGE_RULES_SCRIPT,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载规则合并代码：{MERGE_RULES_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -149,6 +172,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "一行一词的 UTF-8 分词词典；"
             "默认使用项目根目录的 segmentation_words.txt"
+        ),
+    )
+    parser.add_argument(
+        "--dimension-input",
+        type=Path,
+        default=DEFAULT_DIMENSION_INPUT,
+        help=(
+            "与原文件按物理行号对齐的维度提取后问题；"
+            "默认使用 data/dimension_extracted_question.md，"
+            "空行或缺失行按空结果处理"
         ),
     )
     args = parser.parse_args()
@@ -190,6 +223,124 @@ def locate_token_spans(
         spans.append((start, end))
         cursor = end
     return spans
+
+
+def normalize_with_positions(text: str) -> tuple[str, list[int]]:
+    """移除空白，并保留规范化字符到原句字符位置的映射。"""
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        chars.append(char)
+        positions.append(index)
+    return "".join(chars), positions
+
+
+def align_excluded_dimension_positions(
+    original: str,
+    dimension_sentence: str,
+    *,
+    missing_as_empty: bool,
+) -> dict[str, object]:
+    """通过纯删除对齐定位原句中已被抽取的维度字符。"""
+    normalized_original, original_positions = normalize_with_positions(
+        original
+    )
+    normalized_dimension, _ = normalize_with_positions(dimension_sentence)
+
+    if not normalized_dimension:
+        excluded_positions = set(original_positions)
+        status = "缺失按空处理" if missing_as_empty else "空结果"
+    else:
+        matcher = SequenceMatcher(
+            None,
+            normalized_original,
+            normalized_dimension,
+            autojunk=False,
+        )
+        retained_normalized: set[int] = set()
+        invalid_operations: list[str] = []
+        for (
+            tag,
+            original_start,
+            original_end,
+            dimension_start,
+            dimension_end,
+        ) in matcher.get_opcodes():
+            if tag == "equal":
+                retained_normalized.update(
+                    range(original_start, original_end)
+                )
+            elif tag != "delete":
+                invalid_operations.append(
+                    f"{tag}:{original_start}-{original_end}/"
+                    f"{dimension_start}-{dimension_end}"
+                )
+        if invalid_operations:
+            raise ValueError(
+                "维度后问题不是原句的纯删除结果："
+                f"original={original!r}, "
+                f"dimension={dimension_sentence!r}, "
+                f"operations={invalid_operations}"
+            )
+        excluded_positions = {
+            original_positions[index]
+            for index in range(len(original_positions))
+            if index not in retained_normalized
+        }
+        status = (
+            "未删除维度"
+            if not excluded_positions
+            else "已对齐"
+        )
+
+    return {
+        "dimension_sentence": dimension_sentence,
+        "dimension_status": status,
+        "excluded_positions": excluded_positions,
+    }
+
+
+def filter_atomic_relations_by_dimensions(
+    relations: list[dict[str, object]],
+    token_spans: list[tuple[int, int]],
+    excluded_positions: set[int],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """修饰词或中心词与已删除维度重叠时，过滤整条原子关系。"""
+    kept: list[dict[str, object]] = []
+    removed: list[dict[str, object]] = []
+    for relation in relations:
+        modifier_index = int(relation["modifier_index"])
+        head_index = int(relation["head_index"])
+        modifier_start, modifier_end = token_spans[modifier_index]
+        head_start, head_end = token_spans[head_index]
+        modifier_overlaps = any(
+            modifier_start <= position < modifier_end
+            for position in excluded_positions
+        )
+        head_overlaps = any(
+            head_start <= position < head_end
+            for position in excluded_positions
+        )
+        if modifier_overlaps or head_overlaps:
+            removed.append(
+                {
+                    **relation,
+                    "dimension_filter_reason": (
+                        "修饰词和中心词均为已抽取维度"
+                        if modifier_overlaps and head_overlaps
+                        else (
+                            "修饰词为已抽取维度"
+                            if modifier_overlaps
+                            else "中心词为已抽取维度"
+                        )
+                    ),
+                }
+            )
+        else:
+            kept.append(relation)
+    return kept, removed
 
 
 def is_time_word(word: str, pos: str) -> bool:
@@ -909,45 +1060,6 @@ def build_atomic_att_repairs(
             continue
 
         corrected_head = None
-        # 属性词和紧邻的动词性名词同时ATT到更远中心时，优先保留
-        # “属性→局部事件→外层中心”的最短原子链。例如模型把
-        # “高风险→操作、变更→操作”平行输出时，前一条应局部化到
-        # “高风险→变更”。只处理相邻且共享中心的结构。
-        local_event_index = modifier_index + 1
-        if (
-            pos_tags[modifier_index] in ATTRIBUTE_POS
-            and local_event_index < head_index
-            and pos_tags[local_event_index].startswith("v")
-            and pos_tags[head_index].startswith("v")
-            and heads[local_event_index] - 1 == head_index
-            and labels[local_event_index] == "ATT"
-            and words[local_event_index] not in GENERIC_PREDICATE_WORDS
-            and not contains_boundary(
-                modifier_index,
-                head_index,
-                words,
-                pos_tags,
-                include_de=True,
-            )
-        ):
-            replaced_direct_keys.add((modifier_index, head_index))
-            anomalies.append(
-                {
-                    **item,
-                    "anomaly": "parallel_long_attribute",
-                    "reason": "属性词跨过相邻动词性名词平行挂到外层中心",
-                }
-            )
-            record_repair(
-                modifier_index,
-                local_event_index,
-                "local_attribute_head",
-                "high",
-                "属性词优先连接共享外层中心的相邻动词性名词",
-                "ATT",
-            )
-            continue
-
         # “场景的风险项目数”一类结构中，显式“的”左侧修饰语可能
         # 直接越过业务实体挂到指标词。若“的”后的非指标词本身直接
         # ATT到该指标，选择最靠左的这一局部中心，避免仅凭词面猜测。
@@ -2019,6 +2131,9 @@ def analyze_sentence(
         complete_att.append(complete_item)
 
     return {
+        "words": words,
+        "pos_tags": pos_tags,
+        "token_spans": spans,
         "segmentation": " / ".join(words),
         "word_pos": "；".join(
             f"{word}/{pos}"
@@ -2128,6 +2243,9 @@ def main() -> None:
     )
     segmentation_word_set = set(segmentation_words)
     source_lines = args.input.read_text(encoding="utf-8").splitlines()
+    dimension_lines = args.dimension_input.read_text(
+        encoding="utf-8"
+    ).splitlines()
     records = [
         (line_number, line.strip())
         for line_number, line in enumerate(source_lines, start=1)
@@ -2139,6 +2257,7 @@ def main() -> None:
         segmentation_words,
         freq=args.segmentation_word_frequency,
     )
+    merge_rules = load_merge_rules_module()
 
     analyses: list[dict[str, object]] = []
     for start in range(0, len(records), args.batch_size):
@@ -2172,10 +2291,71 @@ def main() -> None:
                 srl,
                 segmentation_word_set,
             )
+            dimension_index = line_number - 1
+            dimension_missing = dimension_index >= len(dimension_lines)
+            dimension_sentence = (
+                ""
+                if dimension_missing
+                else dimension_lines[dimension_index].strip()
+            )
+            dimension_alignment = align_excluded_dimension_positions(
+                sentence,
+                dimension_sentence,
+                missing_as_empty=dimension_missing,
+            )
+            (
+                dimension_filtered_atomic_att,
+                dimension_removed_atomic_att,
+            ) = filter_atomic_relations_by_dimensions(
+                analysis["repaired_atomic_att"],
+                analysis["token_spans"],
+                dimension_alignment["excluded_positions"],
+            )
+            graph_merge_candidates = merge_rules.graph_merge_candidates(
+                sentence,
+                analysis["words"],
+                analysis["pos_tags"],
+                analysis["token_spans"],
+                dimension_filtered_atomic_att,
+                dimension_alignment["excluded_positions"],
+            )
+            srl_merge_candidates = merge_rules.srl_merge_candidates(
+                sentence,
+                analysis["words"],
+                analysis["pos_tags"],
+                analysis["token_spans"],
+                dimension_filtered_atomic_att,
+                analysis["candidates"],
+                dimension_alignment["excluded_positions"],
+            )
+            compact_entity_candidates = (
+                merge_rules.compact_entity_candidates(
+                    sentence,
+                    analysis["words"],
+                    analysis["pos_tags"],
+                    analysis["token_spans"],
+                    dimension_filtered_atomic_att,
+                    dimension_alignment["excluded_positions"],
+                )
+            )
+            rule_merged_att = merge_rules.select_merged_results(
+                graph_merge_candidates,
+                srl_merge_candidates,
+                compact_entity_candidates,
+                METRIC_HEAD_PATTERN,
+            )
             analysis.update(
                 {
                     "source_line": line_number,
                     "sentence": sentence,
+                    **dimension_alignment,
+                    "dimension_filtered_atomic_att": (
+                        dimension_filtered_atomic_att
+                    ),
+                    "dimension_removed_atomic_att": (
+                        dimension_removed_atomic_att
+                    ),
+                    "rule_merged_att": rule_merged_att,
                 }
             )
             analyses.append(analysis)
@@ -2221,6 +2401,22 @@ def main() -> None:
         len(analysis["repaired_atomic_att"])
         for analysis in analyses
     )
+    dimension_filtered_relation_count = sum(
+        len(analysis["dimension_filtered_atomic_att"])
+        for analysis in analyses
+    )
+    dimension_removed_relation_count = sum(
+        len(analysis["dimension_removed_atomic_att"])
+        for analysis in analyses
+    )
+    rule_merged_relation_count = sum(
+        len(analysis["rule_merged_att"])
+        for analysis in analyses
+    )
+    rule_merged_sentence_count = sum(
+        bool(analysis["rule_merged_att"])
+        for analysis in analyses
+    )
 
     output_lines = [
         f"# {args.input.stem} 原子ATT纠错与补召回",
@@ -2236,25 +2432,34 @@ def main() -> None:
         "- SDP作用：只接收受约束的FEAT/dFEAT/mNEG/MANN等证据，"
         "不直接照搬全部语义依存边。",
         "- SRL作用：只提供动词谓词和目标论元证据，不再替换原子ATT。",
-        "- 修复约束：只连接原句中的现有token，不补词、不调序、"
-        "不重建完整定语。",
-        "- 当前阶段：不做维度过滤、完整定语合并、完整后置状态转换"
-        "或Schema映射。",
+        "- 修复约束：原子ATT只连接原句中的现有token，不补词、"
+        "不调序、不重建完整定语。",
+        f"- 维度后问题：`{display_project_path(args.dimension_input)}`。",
+        "- 维度过滤：与原问题按物理行号进行纯删除对齐；修饰词或"
+        "中心词命中已删除维度时过滤整条原子关系；空行及缺失行"
+        "按空结果处理。",
+        "- 规则合并：最后一列复用第4.1阶段的无LLM规则；不修改前面的"
+        "原子ATT结果，不做改写、完整后置状态转换或Schema映射。",
         f"- 原子ATT统计：DEP原始{raw_att_count}条，"
         f"第四阶段POS筛选后{pos_filtered_relation_count}条，"
         f"发现结构异常{anomaly_count}条，"
         f"生成修复候选{repair_count}条，"
-        f"第四阶段最终{repaired_relation_count}条。",
+        f"第四阶段最终{repaired_relation_count}条，"
+        f"去除维度后{dimension_filtered_relation_count}条"
+        f"（过滤{dimension_removed_relation_count}条）。",
+        f"- 规则合并统计：{rule_merged_sentence_count}句产生"
+        f"{rule_merged_relation_count}条结果。",
         f"- SRL旁路统计：动词ATT候选{len(all_candidates)}条，"
         f"连续片段候选{candidate_span_count}条，"
         f"原规则接受{accepted_recovery_count}条；"
         "这些片段只作后续证据，不进入第四阶段原子ATT。",
         "",
         "| 原文件行号 | 原句 | 分词（cws） | 词性（pos） | "
-        "DEP原始ATT及POS判定 | POS筛选ATT | 异常ATT | 原子ATT修复候选 | "
-        "第四阶段原子ATT | DEP动词ATT | SRL证据 | 恢复判定 | "
-        "SRL连续候选 | 接受的动词定语 |",
-        "|---:|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "DEP原始ATT及POS判定 | POS筛选ATT | 异常ATT | "
+        "DEP动词ATT | SRL证据 | 恢复判定 | SRL连续候选 | "
+        "接受的动词定语 | 原子ATT修复候选 | 第四阶段原子ATT | "
+        "第四阶段去除维度原子ATT | 规则合并结果 |",
+        "|---:|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     for analysis in analyses:
@@ -2267,13 +2472,15 @@ def main() -> None:
             f"{escape_table_cell(format_raw_att(analysis['raw_att']))} | "
             f"{escape_table_cell(format_plain_att(analysis['final_atomic_att']))} | "
             f"{escape_table_cell(format_atomic_anomalies(analysis['atomic_anomalies']))} | "
-            f"{escape_table_cell(format_atomic_repairs(analysis['atomic_repair_candidates']))} | "
-            f"{escape_table_cell(format_plain_att(analysis['repaired_atomic_att']))} | "
             f"{escape_table_cell(format_atomic(candidates))} | "
             f"{escape_table_cell(format_srl_evidence(candidates))} | "
             f"{escape_table_cell(format_decisions(candidates))} | "
             f"{escape_table_cell(format_candidate_spans(candidates))} | "
             f"{escape_table_cell(format_recovered(candidates))} |"
+            f" {escape_table_cell(format_atomic_repairs(analysis['atomic_repair_candidates']))} | "
+            f"{escape_table_cell(format_plain_att(analysis['repaired_atomic_att']))} | "
+            f"{escape_table_cell(format_plain_att(analysis['dimension_filtered_atomic_att']))} | "
+            f"{escape_table_cell(merge_rules.format_merged_or_atomic(analysis['rule_merged_att'], analysis['dimension_filtered_atomic_att']))} |"
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -2283,6 +2490,8 @@ def main() -> None:
         f"DEP原始ATT{raw_att_count}条，"
         f"修复候选{repair_count}条，"
         f"第四阶段原子ATT{repaired_relation_count}条；"
+        f"去除维度后{dimension_filtered_relation_count}条；"
+        f"规则合并{rule_merged_relation_count}条；"
         f"SRL连续候选{candidate_span_count}条"
     )
 

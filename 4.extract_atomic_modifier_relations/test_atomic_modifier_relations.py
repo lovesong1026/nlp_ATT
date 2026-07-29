@@ -60,6 +60,64 @@ def relations(
 
 
 class AtomicAttRepairTests(unittest.TestCase):
+    def test_dimension_filter_removes_relation_touching_deleted_text(
+        self,
+    ) -> None:
+        sentence = "全球运营商服务收入"
+        words = ["全球", "运营商", "服务", "收入"]
+        spans = MODULE.locate_token_spans(sentence, words)
+        alignment = MODULE.align_excluded_dimension_positions(
+            sentence,
+            "服务收入",
+            missing_as_empty=False,
+        )
+        relations_input = [
+            {"modifier_index": 0, "head_index": 1},
+            {"modifier_index": 1, "head_index": 3},
+            {"modifier_index": 2, "head_index": 3},
+        ]
+        kept, removed = MODULE.filter_atomic_relations_by_dimensions(
+            relations_input,
+            spans,
+            alignment["excluded_positions"],
+        )
+        self.assertEqual(
+            {
+                (
+                    int(item["modifier_index"]),
+                    int(item["head_index"]),
+                )
+                for item in kept
+            },
+            {(2, 3)},
+        )
+        self.assertEqual(len(removed), 2)
+
+    def test_missing_dimension_line_is_treated_as_empty_result(self) -> None:
+        sentence = "经营状况"
+        words = ["经营", "状况"]
+        alignment = MODULE.align_excluded_dimension_positions(
+            sentence,
+            "",
+            missing_as_empty=True,
+        )
+        kept, removed = MODULE.filter_atomic_relations_by_dimensions(
+            [{"modifier_index": 0, "head_index": 1}],
+            MODULE.locate_token_spans(sentence, words),
+            alignment["excluded_positions"],
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(alignment["dimension_status"], "缺失按空处理")
+
+    def test_dimension_alignment_rejects_rewritten_text(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE.align_excluded_dimension_positions(
+                "全球运营商收入",
+                "海外运营商收入",
+                missing_as_empty=False,
+            )
+
     def test_adjacent_lexical_modifier_recovers_negative_growth(self) -> None:
         words = ["收入", "同比", "负", "增长"]
         pos = ["n", "j", "b", "v"]
@@ -440,7 +498,7 @@ class AtomicAttRepairTests(unittest.TestCase):
         )
         self.assertNotIn(("项目", "存在"), result)
 
-    def test_local_attribute_prefers_adjacent_event_head(self) -> None:
+    def test_parallel_direct_att_relations_are_preserved(self) -> None:
         words = ["高风险", "变更", "操作"]
         pos = ["a", "v", "v"]
         heads = [3, 3, 0]
@@ -455,9 +513,9 @@ class AtomicAttRepairTests(unittest.TestCase):
                 direct_item(1, 2, words, pos),
             ],
         )
-        self.assertIn(("高风险", "变更"), result)
+        self.assertIn(("高风险", "操作"), result)
         self.assertIn(("变更", "操作"), result)
-        self.assertNotIn(("高风险", "操作"), result)
+        self.assertNotIn(("高风险", "变更"), result)
 
     def test_attribute_keeps_nominal_entity_head(self) -> None:
         words = ["高风险", "交付", "项目"]
